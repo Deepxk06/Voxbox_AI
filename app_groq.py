@@ -1,48 +1,21 @@
 from flask import Flask, request, jsonify, render_template_string, Response, stream_with_context
 from groq import Groq
-import google.generativeai as genai
 import json
 import time
 import uuid
 import os
 
-# --- CONFIGURATION (FREE TIER ONLY) ---
+# --- CONFIGURATION ---
 from dotenv import load_dotenv
 load_dotenv()
-
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-
-# Model configurations - FREE TIER PROVIDERS ONLY
-MODELS = {
-    "groq": "llama-3.1-8b-instant",      # Free - No credit card required
-    "gemini": "gemini-pro",               # Free - No credit card required
-}
-
-# Initialize FREE tier clients only
-clients = {}
+MODEL_NAME = "llama-3.1-8b-instant"
 
 try:
-    if GROQ_API_KEY:
-        clients["groq"] = Groq(api_key=GROQ_API_KEY)
-        print("[VoxBox] ✓ Groq (FREE) initialized")
-    else:
-        print("[VoxBox] ⚠ GROQ_API_KEY not set")
+    client = Groq(api_key=GROQ_API_KEY)
 except Exception as e:
-    print(f"[VoxBox] Groq init failed: {e}")
-
-try:
-    if GOOGLE_API_KEY:
-        genai.configure(api_key=GOOGLE_API_KEY)
-        clients["gemini"] = genai
-        print("[VoxBox] ✓ Google Gemini (FREE) initialized")
-    else:
-        print("[VoxBox] ⚠ GOOGLE_API_KEY not set")
-except Exception as e:
-    print(f"[VoxBox] Gemini init failed: {e}")
-
-# Default client (fallback to Groq)
-client = clients.get("groq", None)
+    print(f"[VoxBox] Groq client init failed: {e}")
+    client = None
 
 # --- SYSTEM PROMPT ---
 SYSTEM_PROMPT = {
@@ -130,80 +103,16 @@ def apply_identity_filter(text: str) -> str:
     return text
 
 
-# --- PROVIDER-SPECIFIC HANDLERS ---
-
-def chat_with_groq(messages, temperature, max_tokens, stream=False):
-    """Chat with Groq API"""
-    try:
-        if stream:
-            response = clients["groq"].chat.completions.create(
-                model=MODELS["groq"],
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=True,
-            )
-            return response
-        else:
-            response = clients["groq"].chat.completions.create(
-                model=MODELS["groq"],
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            return response
-    except Exception as e:
-        raise Exception(f"Groq API error: {str(e)}")
-
-
-def chat_with_gemini(messages, temperature, max_tokens, stream=False):
-    """Chat with Google Gemini API"""
-    try:
-        model = genai.GenerativeModel(MODELS["gemini"])
-        
-        # Convert messages format for Gemini
-        gemini_messages = []
-        for msg in messages:
-            if msg['role'] != 'system':
-                gemini_messages.append({
-                    "role": "user" if msg['role'] == 'user' else "model",
-                    "parts": [msg['content']]
-                })
-        
-        if stream:
-            response = model.generate_content(
-                gemini_messages[-1]["parts"][0] if gemini_messages else "Hello",
-                generation_config=genai.types.GenerationConfig(
-                    temperature=temperature,
-                    max_output_tokens=max_tokens,
-                ),
-                stream=True,
-            )
-            return response
-        else:
-            response = model.generate_content(
-                gemini_messages[-1]["parts"][0] if gemini_messages else "Hello",
-                generation_config=genai.types.GenerationConfig(
-                    temperature=temperature,
-                    max_output_tokens=max_tokens,
-                ),
-            )
-            return response
-    except Exception as e:
-        raise Exception(f"Gemini API error: {str(e)}")
-
-
 @app.route('/api/chat/stream', methods=['POST'])
 def chat_stream():
+    if not client:
+        return jsonify({"text": "VoxBox is not ready. Please check your API key."}), 500
+
     try:
         data = request.json
-        provider = data.get('provider', 'groq').lower()  # Default to groq
         client_contents = data.get('contents', [])
         temperature = data.get('temperature', 0.7)
         max_tokens = data.get('max_tokens', 2048)
-
-        if provider not in clients:
-            return jsonify({"error": f"Provider '{provider}' not available. Available: {list(clients.keys())}"}), 400
 
         if not client_contents:
             return jsonify({"error": "No content provided."}), 400
@@ -216,39 +125,29 @@ def chat_stream():
 
         def generate():
             try:
-                if provider == 'groq':
-                    stream = chat_with_groq(messages, temperature, max_tokens, stream=True)
-                    token_count = 0
-                    start_time = time.time()
-                    for chunk in stream:
-                        delta = chunk.choices[0].delta.content
-                        if delta:
-                            filtered = apply_identity_filter(delta)
-                            token_count += len(filtered.split())
-                            yield f"data: {json.dumps({'token': filtered})}\n\n"
-                    elapsed = time.time() - start_time
-                    yield f"data: {json.dumps({'meta': {'tokens': token_count, 'time': round(elapsed, 2), 'provider': 'Groq (FREE)'}})}\n\n"
-                
-                elif provider == 'gemini':
-                    response = chat_with_gemini(messages, temperature, max_tokens, stream=True)
-                    token_count = 0
-                    start_time = time.time()
-                    for chunk in response:
-                        if chunk.text:
-                            filtered = apply_identity_filter(chunk.text)
-                            token_count += len(filtered.split())
-                            yield f"data: {json.dumps({'token': filtered})}\n\n"
-                    elapsed = time.time() - start_time
-                    yield f"data: {json.dumps({'meta': {'tokens': token_count, 'time': round(elapsed, 2), 'provider': 'Google Gemini (FREE)'}})}\n\n"
-                
+                stream = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    stream=True,
+                )
+                token_count = 0
+                start_time = time.time()
+                for chunk in stream:
+                    delta = chunk.choices[0].delta.content
+                    if delta:
+                        filtered = apply_identity_filter(delta)
+                        token_count += len(filtered.split())
+                        yield f"data: {json.dumps({'token': filtered})}\n\n"
+                elapsed = time.time() - start_time
+                yield f"data: {json.dumps({'meta': {'tokens': token_count, 'time': round(elapsed, 2)}})}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
-        generator = generate()
-
         return Response(
-            stream_with_context(generator),
+            stream_with_context(generate()),
             mimetype='text/event-stream',
             headers={
                 'Cache-Control': 'no-cache',
@@ -263,15 +162,12 @@ def chat_stream():
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
+    if not client:
+        return jsonify({"text": "VoxBox is not ready. Please check your API key."}), 500
+
     try:
         data = request.json
-        provider = data.get('provider', 'groq').lower()  # Default to groq
         client_contents = data.get('contents', [])
-        temperature = data.get('temperature', 0.7)
-        max_tokens = data.get('max_tokens', 2048)
-
-        if provider not in clients:
-            return jsonify({"error": f"Provider '{provider}' not available. Available: {list(clients.keys())}"}), 400
 
         if not client_contents:
             return jsonify({"error": "No content provided."}), 400
@@ -283,69 +179,55 @@ def chat():
             messages.append({"role": role, "content": content})
 
         start_time = time.time()
-        
-        if provider == 'groq':
-            response = chat_with_groq(messages, temperature, max_tokens, stream=False)
-            reply = response.choices[0].message.content
-            tokens = response.usage.total_tokens if response.usage else 0
-            provider_name = "Groq (FREE)"
-        elif provider == 'gemini':
-            response = chat_with_gemini(messages, temperature, max_tokens, stream=False)
-            reply = response.text
-            tokens = 0  # Gemini doesn't return token count in free tier
-            provider_name = "Google Gemini (FREE)"
-        else:
-            return jsonify({"error": f"Unknown provider: {provider}"}), 400
-        
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=0.7,
+            max_tokens=2048,
+        )
         elapsed = time.time() - start_time
+
+        reply = response.choices[0].message.content
         reply = apply_identity_filter(reply)
-        
         return jsonify({
             "text": reply,
             "meta": {
-                "tokens": tokens,
-                "time": round(elapsed, 2),
-                "provider": provider_name
+                "tokens": response.usage.total_tokens if response.usage else 0,
+                "time": round(elapsed, 2)
             }
         })
 
     except Exception as e:
-        print(f"[VoxBox] API Error: {e}")
-        return jsonify({"text": f"Something went wrong: {str(e)}"}), 500
+        print(f"[VoxBox] Groq API Error: {e}")
+        return jsonify({"text": "Something went wrong. Please try again."}), 500
 
 
 @app.route('/api/title', methods=['POST'])
 def generate_title():
     """Generate a conversation title from the first message."""
+    if not client:
+        return jsonify({"title": "New Chat"})
+
     try:
         data = request.json
-        provider = data.get('provider', 'groq').lower()
         message = data.get('message', '')
-
-        if provider not in clients:
-            return jsonify({"title": "New Chat"})
 
         if not message:
             return jsonify({"title": "New Chat"})
 
-        title_prompt = [
-            {"role": "system", "content": "Generate a short 3-6 word title for a conversation that starts with the following message. Return ONLY the title, nothing else."},
-            {"role": "user", "content": message}
-        ]
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system",
+                 "content": "Generate a short 3-6 word title for a conversation that starts with the following message. Return ONLY the title, nothing else."},
+                {"role": "user", "content": message}
+            ],
+            temperature=0.5,
+            max_tokens=20,
+        )
 
-        try:
-            if provider == 'groq':
-                response = chat_with_groq(title_prompt, 0.5, 20, stream=False)
-                title = response.choices[0].message.content.strip().strip('"\'')
-            elif provider == 'gemini':
-                response = chat_with_gemini(title_prompt, 0.5, 20, stream=False)
-                title = response.text.strip().strip('"\'')
-            else:
-                return jsonify({"title": "New Chat"})
-            
-            return jsonify({"title": title})
-        except Exception:
-            return jsonify({"title": "New Chat"})
+        title = response.choices[0].message.content.strip().strip('"\'')
+        return jsonify({"title": title})
 
     except Exception:
         return jsonify({"title": "New Chat"})

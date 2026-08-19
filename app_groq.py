@@ -17,20 +17,20 @@ VOXBOX_API_TOKEN = os.getenv("VOXBOX_API_TOKEN", "")
 PROVIDERS = {
     "groq": {
         "label": "Groq (FREE)",
-        "default_model": os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+        "default_model": os.getenv("GROQ_MODEL", "groq/compound-mini"),
         "models": [
-            {"id": "llama-3.1-8b-instant", "label": "Llama 3.1 · 8B"},
-            {"id": "llama-3.3-70b-versatile", "label": "Llama 3.3 · 70B"},
-            {"id": "llama-3.1-70b-versatile", "label": "Llama 3.1 · 70B"},
-            {"id": "mixtral-8x7b-32768", "label": "Mixtral · 8x7B"},
+            {"id": "groq/compound-mini", "label": "Compound · Mini"},
+            {"id": "groq/compound", "label": "Compound"},
+            {"id": "allam-2-7b", "label": "Allam 2 · 7B"},
         ],
     },
     "gemini": {
         "label": "Google Gemini (FREE)",
-        "default_model": os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+        "default_model": os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
         "models": [
-            {"id": "gemini-2.0-flash", "label": "Gemini 2.0 Flash"},
-            {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash"},
+            {"id": "gemini-3.6-flash", "label": "Gemini 3.6 Flash"},
+            {"id": "gemini-3.5-flash-lite", "label": "Gemini 3.5 Flash Lite"},
+            {"id": "gemini-3.5-flash", "label": "Gemini 3.5 Flash"},
         ],
     },
 }
@@ -236,7 +236,9 @@ def chat_stream():
                     for chunk in stream:
                         if chunk.usage and chunk.usage.total_tokens:
                             token_count = chunk.usage.total_tokens
-                        delta = chunk.choices[0].delta.content if chunk.choices else None
+                        delta = None
+                        if chunk.choices:
+                            delta = chunk.choices[0].delta.content or chunk.choices[0].delta.reasoning
                         if delta:
                             filtered = apply_identity_filter(delta)
                             char_count += len(filtered)
@@ -313,7 +315,7 @@ def chat():
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
-            reply = response.choices[0].message.content
+            reply = response.choices[0].message.content or response.choices[0].message.reasoning or ""
             tokens = response.usage.total_tokens if response.usage else max(1, len(reply) // 4)
         else:
             response = gemini_client.models.generate_content(
@@ -3904,4 +3906,4 @@ HTML_TEMPLATE = r"""
 """
 
 if __name__ == '__main__':
-    app.run(debug=True, port=int(os.getenv('PORT', 5000)))
+    app.run(debug=os.getenv('FLASK_DEBUG', '1') == '1', port=int(os.getenv('PORT', 5000)))

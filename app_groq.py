@@ -1,21 +1,57 @@
 from flask import Flask, request, jsonify, render_template_string, Response, stream_with_context
+from flask_cors import CORS
 from groq import Groq
 import json
+import re
 import time
-import uuid
 import os
 
 # --- CONFIGURATION ---
 from dotenv import load_dotenv
 load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-MODEL_NAME = "llama-3.1-8b-instant"
 
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+VOXBOX_API_TOKEN = os.getenv("VOXBOX_API_TOKEN", "")
+
+PROVIDERS = {
+    "groq": {
+        "label": "Groq (FREE)",
+        "default_model": os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+        "models": [
+            {"id": "llama-3.1-8b-instant", "label": "Llama 3.1 · 8B"},
+            {"id": "llama-3.3-70b-versatile", "label": "Llama 3.3 · 70B"},
+            {"id": "llama-3.1-70b-versatile", "label": "Llama 3.1 · 70B"},
+            {"id": "mixtral-8x7b-32768", "label": "Mixtral · 8x7B"},
+        ],
+    },
+    "gemini": {
+        "label": "Google Gemini (FREE)",
+        "default_model": os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+        "models": [
+            {"id": "gemini-2.0-flash", "label": "Gemini 2.0 Flash"},
+            {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash"},
+        ],
+    },
+}
+
+groq_client = None
+if GROQ_API_KEY:
+    try:
+        groq_client = Groq(api_key=GROQ_API_KEY)
+    except Exception as e:
+        print(f"[VoxBox] Groq client init failed: {e}")
+
+gemini_client = None
+genai_types = None
 try:
-    client = Groq(api_key=GROQ_API_KEY)
+    from google import genai as _genai
+    from google.genai import types as _genai_types
+    genai_types = _genai_types
+    if GOOGLE_API_KEY:
+        gemini_client = _genai.Client(api_key=GOOGLE_API_KEY)
 except Exception as e:
-    print(f"[VoxBox] Groq client init failed: {e}")
-    client = None
+    print(f"[VoxBox] Gemini client init failed: {e}")
 
 # --- SYSTEM PROMPT ---
 SYSTEM_PROMPT = {
@@ -85,63 +121,151 @@ EXAMPLES:
 
 # --- FLASK APP ---
 app = Flask(__name__)
+CORS(app)
 
 IDENTITY_FILTERS = [
-    ("Groq", "VoxBox"),
-    ("Llama", "VoxBox"),
-    ("OpenAI", "VoxBox"),
-    ("GPT", "VoxBox"),
-    ("LLM", "assistant"),
-    ("language model", "assistant"),
-    ("as an AI", "as VoxBox"),
+    (r"\bGroq\b", "VoxBox"),
+    (r"\bLlama\b", "VoxBox"),
+    (r"\bOpenAI\b", "VoxBox"),
+    (r"\bGPT\b", "VoxBox"),
+    (r"\bLLM\b", "assistant"),
+    (r"language model", "assistant"),
+    (r"as an AI", "as VoxBox"),
 ]
 
 
 def apply_identity_filter(text: str) -> str:
-    for bad, good in IDENTITY_FILTERS:
-        text = text.replace(bad, good)
+    for pattern, replacement in IDENTITY_FILTERS:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
     return text
+
+
+def enabled_providers() -> dict:
+    available = {}
+    for pid, cfg in PROVIDERS.items():
+        if pid == "groq" and groq_client:
+            available[pid] = cfg
+        elif pid == "gemini" and gemini_client and GOOGLE_API_KEY:
+            available[pid] = cfg
+    return available
+
+
+def default_provider():
+    if groq_client:
+        return "groq"
+    if gemini_client and GOOGLE_API_KEY:
+        return "gemini"
+    return None
+
+
+def check_auth():
+    if not VOXBOX_API_TOKEN:
+        return None
+    if request.headers.get("X-VoxBox-Token", "") != VOXBOX_API_TOKEN:
+        return jsonify({"error": "Unauthorized. Set the X-VoxBox-Token header."}), 401
+    return None
+
+
+def build_groq_messages(contents):
+    messages = [SYSTEM_PROMPT]
+    for msg in contents:
+        role = 'assistant' if msg.get('role') == 'model' else 'user'
+        content = msg.get('parts', [{}])[0].get('text', '')
+        messages.append({"role": role, "content": content})
+    return messages
+
+
+def resolve_provider_and_model(data):
+    provider = data.get('provider') or default_provider()
+    if not provider or provider not in enabled_providers():
+        return None, None
+    model = data.get('model') or PROVIDERS[provider]["default_model"]
+    if model not in [m["id"] for m in PROVIDERS[provider]["models"]]:
+        model = PROVIDERS[provider]["default_model"]
+    return provider, model
+
+
+@app.route('/api/models', methods=['GET'])
+def models_endpoint():
+    auth_error = check_auth()
+    if auth_error:
+        return auth_error
+    providers = enabled_providers()
+    selected = default_provider()
+    return jsonify({
+        "providers": providers,
+        "default_provider": selected,
+        "default_model": PROVIDERS[selected]["default_model"] if selected else None,
+        "auth_required": bool(VOXBOX_API_TOKEN),
+    })
 
 
 @app.route('/api/chat/stream', methods=['POST'])
 def chat_stream():
-    if not client:
-        return jsonify({"text": "VoxBox is not ready. Please check your API key."}), 500
+    auth_error = check_auth()
+    if auth_error:
+        return auth_error
 
     try:
-        data = request.json
-        client_contents = data.get('contents', [])
+        data = request.json or {}
+        contents = data.get('contents', [])
         temperature = data.get('temperature', 0.7)
         max_tokens = data.get('max_tokens', 2048)
 
-        if not client_contents:
+        if not contents:
             return jsonify({"error": "No content provided."}), 400
 
-        messages = [SYSTEM_PROMPT]
-        for msg in client_contents:
-            role = 'assistant' if msg['role'] == 'model' else 'user'
-            content = msg['parts'][0]['text']
-            messages.append({"role": role, "content": content})
+        provider, model = resolve_provider_and_model(data)
+        if not provider:
+            return jsonify({"error": "No provider available. Check your API keys in .env."}), 400
 
         def generate():
             try:
-                stream = client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    stream=True,
-                )
-                token_count = 0
                 start_time = time.time()
-                for chunk in stream:
-                    delta = chunk.choices[0].delta.content
-                    if delta:
-                        filtered = apply_identity_filter(delta)
-                        token_count += len(filtered.split())
-                        yield f"data: {json.dumps({'token': filtered})}\n\n"
+                token_count = 0
+                char_count = 0
+
+                if provider == "groq":
+                    stream = groq_client.chat.completions.create(
+                        model=model,
+                        messages=build_groq_messages(contents),
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        stream=True,
+                    )
+                    for chunk in stream:
+                        if chunk.usage and chunk.usage.total_tokens:
+                            token_count = chunk.usage.total_tokens
+                        delta = chunk.choices[0].delta.content if chunk.choices else None
+                        if delta:
+                            filtered = apply_identity_filter(delta)
+                            char_count += len(filtered)
+                            if not token_count:
+                                token_count = max(1, char_count // 4)
+                            yield f"data: {json.dumps({'token': filtered})}\n\n"
+                else:
+                    stream = gemini_client.models.generate_content_stream(
+                        model=model,
+                        contents=contents,
+                        config=genai_types.GenerateContentConfig(
+                            system_instruction=SYSTEM_PROMPT["content"],
+                            temperature=temperature,
+                            max_output_tokens=max_tokens,
+                        ),
+                    )
+                    for chunk in stream:
+                        if getattr(chunk, 'usage_metadata', None):
+                            token_count = chunk.usage_metadata.total_token_count or token_count
+                        delta = chunk.text
+                        if delta:
+                            filtered = apply_identity_filter(delta)
+                            char_count += len(filtered)
+                            if not token_count:
+                                token_count = max(1, char_count // 4)
+                            yield f"data: {json.dumps({'token': filtered})}\n\n"
+
                 elapsed = time.time() - start_time
-                yield f"data: {json.dumps({'meta': {'tokens': token_count, 'time': round(elapsed, 2)}})}\n\n"
+                yield f"data: {json.dumps({'meta': {'tokens': token_count, 'time': round(elapsed, 2), 'provider': provider, 'model': model}})}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
@@ -162,71 +286,112 @@ def chat_stream():
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
-    if not client:
-        return jsonify({"text": "VoxBox is not ready. Please check your API key."}), 500
+    auth_error = check_auth()
+    if auth_error:
+        return auth_error
 
     try:
-        data = request.json
-        client_contents = data.get('contents', [])
+        data = request.json or {}
+        contents = data.get('contents', [])
+        temperature = data.get('temperature', 0.7)
+        max_tokens = data.get('max_tokens', 2048)
 
-        if not client_contents:
+        if not contents:
             return jsonify({"error": "No content provided."}), 400
 
-        messages = [SYSTEM_PROMPT]
-        for msg in client_contents:
-            role = 'assistant' if msg['role'] == 'model' else 'user'
-            content = msg['parts'][0]['text']
-            messages.append({"role": role, "content": content})
+        provider, model = resolve_provider_and_model(data)
+        if not provider:
+            return jsonify({"error": "No provider available. Check your API keys in .env."}), 400
 
         start_time = time.time()
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            temperature=0.7,
-            max_tokens=2048,
-        )
+        tokens = 0
+
+        if provider == "groq":
+            response = groq_client.chat.completions.create(
+                model=model,
+                messages=build_groq_messages(contents),
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            reply = response.choices[0].message.content
+            tokens = response.usage.total_tokens if response.usage else max(1, len(reply) // 4)
+        else:
+            response = gemini_client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT["content"],
+                    temperature=temperature,
+                    max_output_tokens=max_tokens,
+                ),
+            )
+            reply = response.text
+            if getattr(response, 'usage_metadata', None):
+                tokens = response.usage_metadata.total_token_count or 0
+            if not tokens:
+                tokens = max(1, len(reply) // 4)
+
         elapsed = time.time() - start_time
 
-        reply = response.choices[0].message.content
         reply = apply_identity_filter(reply)
         return jsonify({
             "text": reply,
             "meta": {
-                "tokens": response.usage.total_tokens if response.usage else 0,
-                "time": round(elapsed, 2)
+                "tokens": tokens,
+                "time": round(elapsed, 2),
+                "provider": provider,
+                "model": model,
             }
         })
 
     except Exception as e:
-        print(f"[VoxBox] Groq API Error: {e}")
+        print(f"[VoxBox] API Error: {e}")
         return jsonify({"text": "Something went wrong. Please try again."}), 500
 
 
 @app.route('/api/title', methods=['POST'])
 def generate_title():
     """Generate a conversation title from the first message."""
-    if not client:
-        return jsonify({"title": "New Chat"})
+    auth_error = check_auth()
+    if auth_error:
+        return auth_error
 
     try:
-        data = request.json
+        data = request.json or {}
         message = data.get('message', '')
 
         if not message:
             return jsonify({"title": "New Chat"})
 
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system",
-                 "content": "Generate a short 3-6 word title for a conversation that starts with the following message. Return ONLY the title, nothing else."},
-                {"role": "user", "content": message}
-            ],
-            temperature=0.5,
-            max_tokens=20,
-        )
+        provider, model = resolve_provider_and_model(data)
+        if not provider:
+            return jsonify({"title": "New Chat"})
 
-        title = response.choices[0].message.content.strip().strip('"\'')
+        title_prompt = "Generate a short 3-6 word title for a conversation that starts with the following message. Return ONLY the title, nothing else."
+
+        if provider == "groq":
+            response = groq_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": title_prompt},
+                    {"role": "user", "content": message}
+                ],
+                temperature=0.5,
+                max_tokens=20,
+            )
+            title = response.choices[0].message.content.strip().strip('"\'')
+        else:
+            response = gemini_client.models.generate_content(
+                model=model,
+                contents=[{"role": "user", "parts": [{"text": message}]}],
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=title_prompt,
+                    temperature=0.5,
+                    max_output_tokens=20,
+                ),
+            )
+            title = response.text.strip().strip('"\'')
+
         return jsonify({"title": title})
 
     except Exception:
@@ -235,7 +400,18 @@ def generate_title():
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(HTML_TEMPLATE, model_label=default_model_label(), auth_required=bool(VOXBOX_API_TOKEN))
+
+
+def default_model_label() -> str:
+    provider = default_provider()
+    if not provider:
+        return "No model configured"
+    cfg = PROVIDERS[provider]
+    for m in cfg["models"]:
+        if m["id"] == cfg["default_model"]:
+            return m["label"]
+    return cfg["label"]
 
 
 # --- FRONTEND TEMPLATE ---
@@ -662,6 +838,51 @@ HTML_TEMPLATE = r"""
   .model-btn:hover { background: rgba(123,94,167,0.15); }
   .model-dot { width: 6px; height: 6px; background: var(--green); border-radius: 50%; flex-shrink: 0; }
 
+  /* Model selector dropdown */
+  .model-selector { position: relative; }
+  .model-menu {
+    display: none;
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: var(--shadow-lg);
+    min-width: 250px;
+    padding: 6px;
+    z-index: 80;
+    max-height: 70vh;
+    overflow-y: auto;
+  }
+  .model-menu.open { display: block; }
+  .model-group-label {
+    font-size: 10px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    padding: 10px 10px 4px;
+  }
+  .model-option {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 8px 10px;
+    background: none;
+    border: none;
+    border-radius: 6px;
+    color: var(--text2);
+    font-size: 12.5px;
+    font-family: var(--font-body);
+    cursor: pointer;
+    text-align: left;
+    transition: all 0.15s;
+  }
+  .model-option:hover { background: var(--accent2-dim); color: #c4a9f0; }
+  .model-option.active { color: var(--accent); }
+  .model-opt-check { margin-left: auto; font-size: 10px; }
+
   .status-pill {
     display: none;
     align-items: center;
@@ -961,6 +1182,24 @@ HTML_TEMPLATE = r"""
     user-select: none;
     font-size: 12px;
   }
+
+  /* Inline code console (Run button) */
+  .code-console {
+    background: #07090d;
+    border-top: 1px solid var(--border);
+    padding: 10px 14px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: #a5f3a0;
+    max-height: 220px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .code-console .console-error { color: var(--red); }
+  .code-console .console-muted { color: var(--muted); }
+  .run-status { color: var(--muted); font-style: italic; }
+  .code-run-frame { width: 100%; height: 300px; border: none; border-top: 1px solid var(--border); background: #fff; display: block; }
 
   /* Streaming cursor */
   .streaming-cursor {
@@ -1861,6 +2100,7 @@ HTML_TEMPLATE = r"""
   <div class="sidebar-footer">
     <div class="sidebar-footer-item" id="btn-clear-all"><i class="fas fa-trash-alt"></i> Clear All Conversations</div>
     <div class="sidebar-footer-item" id="btn-export-data"><i class="fas fa-download"></i> Export Data</div>
+    <div class="sidebar-footer-item" id="btn-import-data"><i class="fas fa-upload"></i> Import Data</div>
     <div class="sidebar-footer-item" id="btn-settings-open"><i class="fas fa-cog"></i> Settings</div>
     <div class="sidebar-footer-item" id="btn-shortcuts-open"><i class="fas fa-keyboard"></i> Keyboard Shortcuts</div>
   </div>
@@ -1987,6 +2227,13 @@ HTML_TEMPLATE = r"""
           <input type="checkbox" id="setting-save-history" checked/>
           <span class="toggle-slider"></span>
         </label>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">
+          API Token
+          <small>Required if the server has VOXBOX_API_TOKEN set</small>
+        </div>
+        <input type="password" class="select-input" id="setting-api-token" style="width:200px" placeholder="Optional"/>
       </div>
     </div>
   </div>
@@ -2136,10 +2383,17 @@ HTML_TEMPLATE = r"""
     </div>
 
     <div class="header-right">
-      <button class="model-btn" title="Model">
-        <div class="model-dot"></div>
-        <span class="model-text">Llama 3.1 · 8B</span>
-      </button>
+      {% if auth_required %}
+      <button class="header-btn" id="btn-auth-indicator" title="API authentication is enabled"><i class="fas fa-lock"></i></button>
+      {% endif %}
+      <div class="model-selector">
+        <button class="model-btn" id="model-btn" title="Switch model">
+          <div class="model-dot"></div>
+          <span class="model-text" id="model-text">{{ model_label }}</span>
+          <i class="fas fa-chevron-down" style="font-size:9px"></i>
+        </button>
+        <div class="model-menu" id="model-menu"></div>
+      </div>
       <button class="header-btn" id="btn-voice-toggle" title="Voice Input"><i class="fas fa-microphone"></i></button>
       <button class="header-btn" id="btn-caps" title="Capabilities"><i class="fas fa-info-circle"></i></button>
       <button class="header-btn" id="btn-export" title="Export"><i class="fas fa-download"></i></button>
@@ -2193,6 +2447,7 @@ HTML_TEMPLATE = r"""
 
 <!-- Hidden file input -->
 <input type="file" id="file-input" style="display:none" multiple accept=".txt,.py,.js,.ts,.java,.c,.cpp,.cs,.go,.rs,.php,.rb,.swift,.kt,.dart,.sql,.html,.css,.sh,.yaml,.yml,.json,.md,.xml,.log,.csv,.toml,.ini,.cfg,.env,.jsx,.tsx,.vue,.svelte"/>
+<input type="file" id="import-input" style="display:none" accept=".json,application/json"/>
 
 <script>
 (function(){
@@ -2222,6 +2477,10 @@ HTML_TEMPLATE = r"""
   const tokenInfo    = $('token-info');
   const fileInput    = $('file-input');
   const attachArea   = $('attachments-area');
+  const importInput  = $('import-input');
+  const modelBtn     = $('model-btn');
+  const modelMenu    = $('model-menu');
+  const modelText    = $('model-text');
 
   /* Modals/overlays */
   const capsOverlay    = $('caps-overlay');
@@ -2246,6 +2505,8 @@ HTML_TEMPLATE = r"""
   let messageReactions = {};
   let isRecording     = false;
   let recognition     = null;
+  let apiToken        = localStorage.getItem('voxbox_token') || '';
+  let modelsData      = null;
 
   /* Settings */
   let settings = JSON.parse(localStorage.getItem('voxbox_settings') || JSON.stringify({
@@ -2259,6 +2520,8 @@ HTML_TEMPLATE = r"""
     streaming: true,
     autoScroll: true,
     saveHistory: true,
+    provider: null,
+    model: null,
   }));
 
   /* ═══════════════════════════ INIT ═══════════════════════════ */
@@ -2267,6 +2530,103 @@ HTML_TEMPLATE = r"""
   applySettings();
   renderConvList();
   showWelcome();
+  initModels();
+
+  /* ═══════════════════════════ HELPERS ═══════════════════════════ */
+  function newMsgId() {
+    return 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  }
+
+  async function apiFetch(url, opts = {}) {
+    opts.headers = Object.assign({}, opts.headers || {});
+    if (apiToken) opts.headers['X-VoxBox-Token'] = apiToken;
+    const res = await fetch(url, opts);
+    if (res.status === 401 && !apiToken) {
+      const token = prompt('This VoxBox server requires an API token. Enter it:');
+      if (token) {
+        apiToken = token;
+        localStorage.setItem('voxbox_token', token);
+        $('setting-api-token').value = token;
+        return apiFetch(url, opts);
+      }
+    }
+    return res;
+  }
+
+  /* ═══════════════════════════ MODELS ═══════════════════════════ */
+  function modelLabelOf(provider, model) {
+    if (!modelsData || !modelsData.providers) return 'Unknown';
+    const cfg = modelsData.providers[provider];
+    if (!cfg) return 'Unknown';
+    const m = cfg.models.find(x => x.id === model);
+    return m ? m.label : cfg.default_model;
+  }
+
+  async function initModels() {
+    try {
+      const res = await apiFetch('/api/models');
+      if (!res.ok) return;
+      const data = await res.json();
+      modelsData = data;
+
+      if (!data.providers || Object.keys(data.providers).length === 0) {
+        modelText.textContent = 'No provider configured';
+        return;
+      }
+
+      if (!settings.provider || !data.providers[settings.provider]) {
+        settings.provider = data.default_provider;
+      }
+      const cfg = data.providers[settings.provider];
+      if (cfg) {
+        if (!settings.model || !cfg.models.some(m => m.id === settings.model)) {
+          settings.model = cfg.default_model;
+        }
+        modelText.textContent = modelLabelOf(settings.provider, settings.model);
+      }
+      saveSettings();
+      buildModelMenu(data);
+    } catch (e) {}
+  }
+
+  function buildModelMenu(data) {
+    modelMenu.innerHTML = '';
+    for (const [pid, cfg] of Object.entries(data.providers)) {
+      const label = document.createElement('div');
+      label.className = 'model-group-label';
+      label.textContent = cfg.label;
+      modelMenu.appendChild(label);
+      cfg.models.forEach(m => {
+        const opt = document.createElement('button');
+        const isActive = pid === settings.provider && m.id === settings.model;
+        opt.className = 'model-option' + (isActive ? ' active' : '');
+        opt.innerHTML = m.label + (isActive ? ' <span class="model-opt-check"><i class="fas fa-check"></i></span>' : '');
+        opt.addEventListener('click', () => {
+          settings.provider = pid;
+          settings.model = m.id;
+          saveSettings();
+          modelText.textContent = m.label;
+          modelMenu.classList.remove('open');
+          buildModelMenu(data);
+          showToast(`Switched to ${cfg.label} · ${m.label}`, 'success');
+        });
+        modelMenu.appendChild(opt);
+      });
+    }
+  }
+
+  modelBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    modelMenu.classList.toggle('open');
+  });
+  document.addEventListener('click', () => modelMenu.classList.remove('open'));
+
+  $('setting-api-token').addEventListener('change', (e) => {
+    apiToken = e.target.value.trim();
+    if (apiToken) localStorage.setItem('voxbox_token', apiToken);
+    else localStorage.removeItem('voxbox_token');
+    showToast(apiToken ? 'API token saved' : 'API token cleared', 'info');
+  });
 
   /* ═══════════════════════════ SETTINGS ═══════════════════════════ */
   function applySettings() {
@@ -2467,6 +2827,8 @@ HTML_TEMPLATE = r"""
   }
 
   /* ═══════════════════════════ RENDER MARKDOWN ═══════════════════════════ */
+  const RUNNABLE_LANGS = { javascript: 1, js: 1, python: 1, py: 1, html: 1 };
+
   function renderMarkdown(text) {
     const codeBlockRe = /```(\w*)?\n?([\s\S]*?)```/g;
     let idx = 0;
@@ -2505,12 +2867,16 @@ HTML_TEMPLATE = r"""
       const iconClass = langIcons[lang] || 'fas fa-code';
       const label = lang || 'code';
       const lineCount = code.split('\n').length;
+      const runnable = RUNNABLE_LANGS[lang]
+        ? `<button class="btn-code-action" onclick="VB.runCode(this)" title="Run in browser"><i class="fas fa-play"></i> Run</button>`
+        : '';
 
       const wrapper = `
         <div class="code-block-wrapper">
           <div class="code-block-header">
             <span class="code-lang-label"><i class="${iconClass}"></i> ${label} <span style="color:var(--muted2);font-size:10px;margin-left:6px;">${lineCount} lines</span></span>
             <div class="code-actions">
+              ${runnable}
               <button class="btn-code-action" onclick="VB.wrapCode(this)" title="Wrap lines"><i class="fas fa-text-width"></i></button>
               <button class="btn-code-action" onclick="VB.copyCode(this)"><i class="fas fa-copy"></i> Copy</button>
             </div>
@@ -2523,7 +2889,79 @@ HTML_TEMPLATE = r"""
   }
 
   /* ═══════════════════════════ GLOBAL FUNCTIONS ═══════════════════════════ */
+  const fmtVal = x => (typeof x === 'object' && x !== null) ? JSON.stringify(x, null, 2) : String(x);
+  let pyodidePromise = null;
+
+  function loadPyodideScript() {
+    if (window.pyodide) return Promise.resolve();
+    if (!pyodidePromise) {
+      pyodidePromise = new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js';
+        s.onload = async () => { window.pyodide = await loadPyodide(); resolve(); };
+        s.onerror = () => { pyodidePromise = null; reject(new Error('Failed to load the Python runtime (Pyodide)')); };
+        document.head.appendChild(s);
+      });
+    }
+    return pyodidePromise;
+  }
+
   window.VB = {
+    runCode(btn) {
+      const wrapper = btn.closest('.code-block-wrapper');
+      const codeEl = wrapper.querySelector('code');
+      const code = decodeURIComponent(codeEl.dataset.raw || '') || codeEl.innerText;
+      const lang = (codeEl.className.match(/language-(\w+)/) || ['', ''])[1].toLowerCase();
+
+      const consoleEl = document.createElement('div');
+      consoleEl.className = 'code-console';
+      wrapper.appendChild(consoleEl);
+
+      const logs = [];
+      const write = (text, cls) => {
+        logs.push({ text, cls });
+        consoleEl.innerHTML = logs.map(l => `<span class="${l.cls || ''}">${escHtml(l.text)}</span>`).join('\n');
+        consoleEl.scrollTop = consoleEl.scrollHeight;
+      };
+
+      const run = async () => {
+        try {
+          if (lang === 'javascript' || lang === 'js') {
+            const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
+            const captured = {
+              log: (...a) => write(a.map(fmtVal).join(' ')),
+              info: (...a) => write(a.map(fmtVal).join(' ')),
+              warn: (...a) => write(a.map(fmtVal).join(' ')),
+              error: (...a) => write(a.map(fmtVal).join(' '), 'console-error'),
+              dir: (o) => write(fmtVal(o)),
+              table: (o) => write(fmtVal(o)),
+            };
+            const fn = new AsyncFunction('console', code);
+            const result = await fn(captured);
+            if (result !== undefined) write(String(result));
+          } else if (lang === 'python' || lang === 'py') {
+            write('Loading Python runtime (first run may take a moment)...', 'run-status');
+            await loadPyodideScript();
+            window.pyodide.setStdout({ batched: s => write(s) });
+            window.pyodide.setStderr({ batched: s => write(s, 'console-error') });
+            await window.pyodide.runPythonAsync(code);
+          } else if (lang === 'html') {
+            const iframe = document.createElement('iframe');
+            iframe.className = 'code-run-frame';
+            wrapper.appendChild(iframe);
+            iframe.contentDocument.open();
+            iframe.contentDocument.write(code);
+            iframe.contentDocument.close();
+          } else {
+            write('Running is not supported for: ' + lang, 'console-error');
+          }
+        } catch (err) {
+          write('Error: ' + err.message, 'console-error');
+        }
+      };
+      run();
+    },
+
     copyCode(btn) {
       const code = btn.closest('.code-block-wrapper').querySelector('code');
       const text = decodeURIComponent(code.dataset.raw || '') || code.innerText;
@@ -2563,8 +3001,8 @@ HTML_TEMPLATE = r"""
       }
     },
 
-    toggleReaction(btn, index, type) {
-      const key = `${index}_${type}`;
+    toggleReaction(btn, msgId, type) {
+      const key = `${msgId}_${type}`;
       if (messageReactions[key]) {
         delete messageReactions[key];
         btn.classList.remove('active-reaction');
@@ -2573,19 +3011,19 @@ HTML_TEMPLATE = r"""
         btn.classList.add('active-reaction');
         // Remove opposite reaction
         const opposite = type === 'up' ? 'down' : 'up';
-        const oppKey = `${index}_${opposite}`;
+        const oppKey = `${msgId}_${opposite}`;
         delete messageReactions[oppKey];
         const oppBtn = btn.parentElement.querySelector(`.reaction-${opposite}`);
         if (oppBtn) oppBtn.classList.remove('active-reaction');
       }
     },
 
-    pinMessage(index) {
-      if (pinnedMessages.has(index)) {
-        pinnedMessages.delete(index);
+    pinMessage(msgId) {
+      if (pinnedMessages.has(msgId)) {
+        pinnedMessages.delete(msgId);
         showToast('Message unpinned', 'info');
       } else {
-        pinnedMessages.add(index);
+        pinnedMessages.add(msgId);
         showToast('Message pinned', 'success');
       }
       rebuildMessages();
@@ -2602,12 +3040,12 @@ HTML_TEMPLATE = r"""
     return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
-  function addUserBubble(text, index) {
+  function addUserBubble(text, index, msgId) {
     const group = document.createElement('div');
     group.className = 'msg-group user';
     group.dataset.index = index;
 
-    const isPinned = pinnedMessages.has(index);
+    const isPinned = pinnedMessages.has(msgId);
 
     group.innerHTML = `
       <div class="msg-header">
@@ -2620,22 +3058,22 @@ HTML_TEMPLATE = r"""
       <div class="msg-actions">
         <button class="action-btn" onclick="VB.editMessage(${index})"><i class="fas fa-pen"></i> Edit</button>
         <button class="action-btn" onclick="VB.copyResponse(this,'${encodeURIComponent(text)}')"><i class="fas fa-copy"></i> Copy</button>
-        <button class="action-btn" onclick="VB.pinMessage(${index})"><i class="fas fa-thumbtack"></i> ${isPinned?'Unpin':'Pin'}</button>
+        <button class="action-btn" onclick="VB.pinMessage('${msgId}')"><i class="fas fa-thumbtack"></i> ${isPinned?'Unpin':'Pin'}</button>
       </div>`;
     list.appendChild(group);
     if (settings.autoScroll) scrollToBottom();
     return group;
   }
 
-  function addBotGroup(htmlContent, rawText, index) {
+  function addBotGroup(htmlContent, rawText, msgId) {
     const group = document.createElement('div');
     group.className = 'msg-group bot';
-    group.dataset.index = index;
+    group.dataset.index = msgId;
 
-    const isPinned = pinnedMessages.has(index);
+    const isPinned = pinnedMessages.has(msgId);
     const rawEnc = encodeURIComponent(rawText || '');
-    const upActive = messageReactions[`${index}_up`] ? 'active-reaction' : '';
-    const downActive = messageReactions[`${index}_down`] ? 'active-reaction' : '';
+    const upActive = messageReactions[`${msgId}_up`] ? 'active-reaction' : '';
+    const downActive = messageReactions[`${msgId}_down`] ? 'active-reaction' : '';
 
     group.innerHTML = `
       <div class="msg-header">
@@ -2646,12 +3084,12 @@ HTML_TEMPLATE = r"""
       <div class="bubble markdown-body" style="font-size:${settings.fontSize}px">${htmlContent}</div>
       ${isPinned ? '<div class="pinned-indicator"><i class="fas fa-thumbtack"></i> Pinned</div>' : ''}
       <div class="msg-actions">
-        <button class="action-btn reaction-up ${upActive}" onclick="VB.toggleReaction(this,${index},'up')"><i class="fas fa-thumbs-up"></i></button>
-        <button class="action-btn reaction-down ${downActive}" onclick="VB.toggleReaction(this,${index},'down')"><i class="fas fa-thumbs-down"></i></button>
+        <button class="action-btn reaction-up ${upActive}" onclick="VB.toggleReaction(this,'${msgId}','up')"><i class="fas fa-thumbs-up"></i></button>
+        <button class="action-btn reaction-down ${downActive}" onclick="VB.toggleReaction(this,'${msgId}','down')"><i class="fas fa-thumbs-down"></i></button>
         <button class="action-btn" onclick="VB.copyResponse(this,'${rawEnc}')"><i class="fas fa-copy"></i> Copy</button>
         <button class="action-btn regen-btn" onclick="VB.regenerate()"><i class="fas fa-redo"></i> Regenerate</button>
         <button class="action-btn" onclick="VB.readAloud('${rawEnc}')"><i class="fas fa-volume-up"></i> Read</button>
-        <button class="action-btn" onclick="VB.pinMessage(${index})"><i class="fas fa-thumbtack"></i> ${isPinned?'Unpin':'Pin'}</button>
+        <button class="action-btn" onclick="VB.pinMessage('${msgId}')"><i class="fas fa-thumbtack"></i> ${isPinned?'Unpin':'Pin'}</button>
       </div>`;
 
     list.appendChild(group);
@@ -2676,8 +3114,8 @@ HTML_TEMPLATE = r"""
     list.innerHTML = '';
     for (let i = 0; i < history.length; i++) {
       const m = history[i];
-      if (m.role === 'user') addUserBubble(m.content, i);
-      else addBotGroup(renderMarkdown(m.content), m.content, i);
+      if (m.role === 'user') addUserBubble(m.content, i, m.id);
+      else addBotGroup(renderMarkdown(m.content), m.content, m.id);
     }
     updateMsgCount();
   }
@@ -2699,19 +3137,23 @@ HTML_TEMPLATE = r"""
     return group;
   }
 
+  let lastStreamRender = 0;
+  const STREAM_RENDER_THROTTLE_MS = 80;
   function updateStreamingBubble(rawText) {
+    const now = performance.now();
+    if (now - lastStreamRender < STREAM_RENDER_THROTTLE_MS) return;
+    lastStreamRender = now;
     const bubble = $('streaming-bubble');
     if (!bubble) return;
     bubble.innerHTML = renderMarkdown(rawText) + '<span class="streaming-cursor"></span>';
     if (settings.autoScroll) scrollToBottom();
   }
 
-  function finalizeStreamingGroup(rawText) {
+  function finalizeStreamingGroup(rawText, msgId) {
     const group = $('streaming-group');
     if (!group) return;
     group.id = '';
-    const idx = history.length;
-    group.dataset.index = idx;
+    group.dataset.index = msgId;
     const bubble = group.querySelector('.bubble');
     bubble.innerHTML = renderMarkdown(rawText);
 
@@ -2719,12 +3161,12 @@ HTML_TEMPLATE = r"""
     const actions = document.createElement('div');
     actions.className = 'msg-actions';
     actions.innerHTML = `
-      <button class="action-btn reaction-up" onclick="VB.toggleReaction(this,${idx},'up')"><i class="fas fa-thumbs-up"></i></button>
-      <button class="action-btn reaction-down" onclick="VB.toggleReaction(this,${idx},'down')"><i class="fas fa-thumbs-down"></i></button>
+      <button class="action-btn reaction-up" onclick="VB.toggleReaction(this,'${msgId}','up')"><i class="fas fa-thumbs-up"></i></button>
+      <button class="action-btn reaction-down" onclick="VB.toggleReaction(this,'${msgId}','down')"><i class="fas fa-thumbs-down"></i></button>
       <button class="action-btn" onclick="VB.copyResponse(this,'${rawEnc}')"><i class="fas fa-copy"></i> Copy</button>
       <button class="action-btn" onclick="VB.regenerate()"><i class="fas fa-redo"></i> Regenerate</button>
       <button class="action-btn" onclick="VB.readAloud('${rawEnc}')"><i class="fas fa-volume-up"></i> Read</button>
-      <button class="action-btn" onclick="VB.pinMessage(${idx})"><i class="fas fa-thumbtack"></i> Pin</button>`;
+      <button class="action-btn" onclick="VB.pinMessage('${msgId}')"><i class="fas fa-thumbtack"></i> Pin</button>`;
     group.appendChild(actions);
 
     if (settings.autoScroll) scrollToBottom();
@@ -2824,7 +3266,7 @@ HTML_TEMPLATE = r"""
 
   /* ═══════════════════════════ COUNT ═══════════════════════════ */
   function updateMsgCount() {
-    msgCount.textContent = `${history.length} messages`;
+    msgCount.textContent = `${history.length} messages${totalTokens ? ' · ' + totalTokens + ' tokens' : ''}`;
   }
 
   /* ═══════════════════════════ AUTO-RESIZE ═══════════════════════════ */
@@ -2862,8 +3304,9 @@ HTML_TEMPLATE = r"""
 
     lastUserMsg = text;
     const idx = history.length;
-    history.push({ role: 'user', content: text });
-    addUserBubble(text, idx);
+    const userMsgId = newMsgId();
+    history.push({ role: 'user', content: text, id: userMsgId });
+    addUserBubble(text, idx, userMsgId);
     inputEl.value = '';
     inputEl.style.height = 'auto';
     charCounter.textContent = `0 / ${MAX_CHARS}`;
@@ -2876,10 +3319,10 @@ HTML_TEMPLATE = r"""
       let title = text.length > 50 ? text.slice(0, 50) + '…' : text;
 
       // Try to generate a smart title
-      fetch('/api/title', {
+      apiFetch('/api/title', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text })
+        body: JSON.stringify({ message: text, provider: settings.provider, model: settings.model })
       }).then(r => r.json()).then(data => {
         if (data.title && data.title !== 'New Chat') {
           const conv = conversations.find(c => c.id === currentConvId);
@@ -2892,7 +3335,7 @@ HTML_TEMPLATE = r"""
         }
       }).catch(() => {});
 
-      conversations.unshift({ id: currentConvId, title, history: [], timestamp: Date.now() });
+      conversations.unshift({ id: currentConvId, title, history: [], timestamp: Date.now(), tokens: 0 });
       headerTitle.textContent = title;
       saveConversations();
       renderConvList();
@@ -2922,13 +3365,15 @@ HTML_TEMPLATE = r"""
   async function streamResponse(contents) {
     try {
       showThinking();
-      const resp = await fetch('/api/chat/stream', {
+      const resp = await apiFetch('/api/chat/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents,
           temperature: settings.temperature,
-          max_tokens: settings.maxTokens
+          max_tokens: settings.maxTokens,
+          provider: settings.provider,
+          model: settings.model
         })
       });
       hideThinking();
@@ -2954,8 +3399,9 @@ HTML_TEMPLATE = r"""
           if (!line.startsWith('data: ')) continue;
           const payload = line.slice(6).trim();
           if (payload === '[DONE]') {
-            finalizeStreamingGroup(raw);
-            history.push({ role: 'model', content: raw });
+            const msgId = newMsgId();
+            finalizeStreamingGroup(raw, msgId);
+            history.push({ role: 'model', content: raw, id: msgId });
             saveCurrentConv();
             updateMsgCount();
             speak(raw);
@@ -2977,8 +3423,9 @@ HTML_TEMPLATE = r"""
     } catch(err) {
       hideThinking();
       const msg = "Sorry, something went wrong. Please try again.";
-      addBotGroup(msg, msg, history.length);
-      history.push({ role: 'model', content: msg });
+      const msgId = newMsgId();
+      addBotGroup(msg, msg, msgId);
+      history.push({ role: 'model', content: msg, id: msgId });
       showToast('Connection error', 'error');
     } finally {
       activeReader = null;
@@ -2992,22 +3439,24 @@ HTML_TEMPLATE = r"""
   async function fetchResponse(contents) {
     showThinking();
     try {
-      const res = await fetch('/api/chat', {
+      const res = await apiFetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents,
           temperature: settings.temperature,
-          max_tokens: settings.maxTokens
+          max_tokens: settings.maxTokens,
+          provider: settings.provider,
+          model: settings.model
         })
       });
       if (!res.ok) throw new Error('Server error');
       const data = await res.json();
       const reply = data.text.trim();
       hideThinking();
-      const idx = history.length;
-      addBotGroup(renderMarkdown(reply), reply, idx);
-      history.push({ role: 'model', content: reply });
+      const msgId = newMsgId();
+      addBotGroup(renderMarkdown(reply), reply, msgId);
+      history.push({ role: 'model', content: reply, id: msgId });
       saveCurrentConv();
       updateMsgCount();
       if (data.meta) {
@@ -3018,7 +3467,9 @@ HTML_TEMPLATE = r"""
     } catch {
       hideThinking();
       const msg = "Sorry, something went wrong. Please try again.";
-      addBotGroup(msg, msg, history.length);
+      const msgId = newMsgId();
+      addBotGroup(msg, msg, msgId);
+      history.push({ role: 'model', content: msg, id: msgId });
       showToast('Connection error', 'error');
     } finally {
       isStreaming = false;
@@ -3038,8 +3489,9 @@ HTML_TEMPLATE = r"""
     const sb = $('streaming-bubble');
     if (sb) {
       const raw = sb.innerText.replace(/[\u2588]/g,'').trim();
-      finalizeStreamingGroup(raw);
-      if (raw) { history.push({ role: 'model', content: raw }); saveCurrentConv(); updateMsgCount(); }
+      const msgId = newMsgId();
+      finalizeStreamingGroup(raw, msgId);
+      if (raw) { history.push({ role: 'model', content: raw, id: msgId }); saveCurrentConv(); updateMsgCount(); }
     }
     showToast('Generation stopped', 'info');
   });
@@ -3056,6 +3508,7 @@ HTML_TEMPLATE = r"""
     if (idx >= 0) {
       conversations[idx].history = [...history];
       conversations[idx].timestamp = Date.now();
+      conversations[idx].tokens = totalTokens;
     }
     saveConversations();
     renderConvList();
@@ -3097,7 +3550,7 @@ HTML_TEMPLATE = r"""
         item.innerHTML = `
           <i class="fas fa-comment-dots"></i>
           <span class="conv-item-text">${escHtml(conv.title)}</span>
-          <span class="conv-item-time">${getRelativeTime(conv.timestamp)}</span>
+          <span class="conv-item-time">${getRelativeTime(conv.timestamp)}${(conv.tokens || 0) ? ' · ' + conv.tokens + ' tok' : ''}</span>
           <div class="conv-actions">
             <button class="conv-action-btn rename" title="Rename"><i class="fas fa-pen"></i></button>
             <button class="conv-action-btn delete" title="Delete"><i class="fas fa-trash"></i></button>
@@ -3147,10 +3600,10 @@ HTML_TEMPLATE = r"""
     const conv = conversations.find(c => c.id === id);
     if (!conv) return;
     currentConvId = id;
-    history = [...(conv.history || [])];
+    history = (conv.history || []).map(m => ({ role: m.role, content: m.content, id: m.id || newMsgId() }));
     pinnedMessages = new Set();
     messageReactions = {};
-    totalTokens = 0;
+    totalTokens = conv.tokens || 0;
     tokenInfo.textContent = '';
     headerTitle.textContent = conv.title;
     rebuildMessages();
@@ -3257,6 +3710,42 @@ HTML_TEMPLATE = r"""
   exportOvr.addEventListener('click', e => { if (e.target === exportOvr) exportOvr.classList.remove('open'); });
   document.querySelectorAll('.export-btn').forEach(btn => {
     btn.addEventListener('click', () => exportChat(btn.dataset.format));
+  });
+
+  /* ═══════════════════════════ IMPORT ═══════════════════════════ */
+  $('btn-import-data').addEventListener('click', () => { closeSidebar(); importInput.click(); });
+
+  importInput.addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        const msgs = Array.isArray(data) ? data : (data.messages || []);
+        if (!msgs.length) { showToast('No messages found in file', 'error'); return; }
+        const first = msgs[0].content || (msgs[0].parts && msgs[0].parts[0] && msgs[0].parts[0].text) || '';
+        const conv = {
+          id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+          title: data.title || first.slice(0, 40) || 'Imported Chat',
+          history: msgs.map(m => ({
+            role: (m.role === 'model' || m.role === 'assistant') ? 'model' : 'user',
+            content: m.content || (m.parts && m.parts[0] && m.parts[0].text) || '',
+            id: newMsgId(),
+          })),
+          timestamp: Date.now(),
+          tokens: 0,
+        };
+        conversations.unshift(conv);
+        saveConversations();
+        loadConversation(conv.id);
+        showToast('Conversation imported', 'success');
+      } catch (err) {
+        showToast('Invalid JSON file', 'error');
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
   });
 
   /* ═══════════════════════════ MODAL HANDLERS ═══════════════════════════ */
@@ -3415,4 +3904,4 @@ HTML_TEMPLATE = r"""
 """
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=int(os.getenv('PORT', 5000)))

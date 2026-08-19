@@ -1,26 +1,29 @@
-# VoxBox AI - Free Tier Multi-Provider Coding Assistant
+# VoxBox AI — Free Tier Voice Coding Assistant
 
-VoxBox is a fast, intelligent, and friendly coding voice assistant that supports multiple **FREE** AI providers:
-- **Groq** (llama-3.1-8b-instant) - ✅ Free, No credit card required
-- **Google Gemini** (gemini-pro) - ✅ Free, No credit card required
+VoxBox is a fast, intelligent coding voice assistant powered by **free** AI providers:
 
-🎯 **100% FREE** - No credit cards, no hidden costs, no rate limits (within fair use)
+- **Groq** — `llama-3.1-8b-instant`, `llama-3.3-70b-versatile`, `mixtral-8x7b-32768` (free, no credit card)
+- **Google Gemini** — `gemini-2.0-flash`, `gemini-2.5-flash` (free, no credit card)
+
+Switch providers/models from a dropdown in the header — no restart needed.
 
 ## Features
 
-✨ Multiple FREE AI providers with seamless switching
-🚀 Streaming and non-streaming chat endpoints
-🎯 Intelligent conversation title generation
-💻 Support for 40+ programming languages
-🎨 Beautiful dark/light theme UI
-⚡ Real-time token counting and response timing
-💰 **COMPLETELY FREE** - No subscription needed
+- Multi-provider (Groq + Gemini) with in-UI **model selector**
+- Streaming (SSE) and non-streaming chat endpoints
+- **Run code blocks in the browser** (JavaScript / Python / HTML)
+- Voice input (Web Speech API) and voice output (TTS)
+- Conversation history, search, **import/export** (JSON/MD/TXT/HTML)
+- Per-conversation **token usage** tracking
+- Dark/light theme, command palette, keyboard shortcuts
+- Markdown rendering with syntax highlighting and Mermaid diagrams
+- Optional **API token auth** for remote deployments
+- **CORS enabled** for cross-origin API clients
 
 ## Installation
 
 ### Prerequisites
-- Python 3.8+
-- Virtual environment (recommended)
+- Python 3.9+
 
 ### Setup
 
@@ -30,12 +33,12 @@ git clone <repo-url>
 cd Voxbox_AI
 ```
 
-2. **Create and activate virtual environment**
+2. **Create and activate a virtual environment**
 ```bash
 python -m venv .venv
-# On Windows:
+# Windows:
 .venv\Scripts\activate
-# On macOS/Linux:
+# macOS/Linux:
 source .venv/bin/activate
 ```
 
@@ -44,17 +47,24 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-4. **Configure API Keys (FREE)**
-Create a `.env` file in the root directory with your FREE API keys:
+4. **Configure API keys (free)**
+```bash
+copy .env.example .env
+# Windows (PowerShell):
+# Copy-Item .env.example .env
+```
+Edit `.env`:
 ```env
 GROQ_API_KEY="your_free_groq_api_key"
 GOOGLE_API_KEY="your_free_google_api_key"
 ```
 
+> One provider key is enough — VoxBox only shows providers you have keys for.
+
 ### Getting FREE API Keys
 
-- **Groq**: https://console.groq.com/ (✅ No credit card needed)
-- **Google Gemini**: https://makersuite.google.com/app/apikey (✅ No credit card needed)
+- **Groq**: https://console.groq.com/ — no credit card needed
+- **Google Gemini**: https://aistudio.google.com/app/apikey — no credit card needed
 
 ## Usage
 
@@ -62,163 +72,127 @@ GOOGLE_API_KEY="your_free_google_api_key"
 ```bash
 python app_groq.py
 ```
-
-The app will start on `http://localhost:5000`
+Open `http://localhost:5000` (port configurable via `PORT` env var).
 
 ### API Endpoints
 
-#### 1. Chat Endpoint (Streaming)
-**POST** `/api/chat/stream`
+All endpoints accept an optional `provider` and `model`. CORS is enabled, and if
+`VOXBOX_API_TOKEN` is set, all requests must include the header
+`X-VoxBox-Token: <token>`.
 
-Request:
+#### 1. List Providers/Models
+**GET** `/api/models`
+```json
+{
+  "providers": {
+    "groq": {"label": "Groq (FREE)", "default_model": "llama-3.1-8b-instant", "models": [...]},
+    "gemini": {"label": "Google Gemini (FREE)", "default_model": "gemini-2.0-flash", "models": [...]}
+  },
+  "default_provider": "groq",
+  "default_model": "llama-3.1-8b-instant",
+  "auth_required": false
+}
+```
+
+#### 2. Chat Endpoint (Streaming)
+**POST** `/api/chat/stream`
 ```json
 {
   "provider": "groq",
-  "contents": [
-    {
-      "role": "user",
-      "parts": [{"text": "How do I write a Python function?"}]
-    }
-  ],
+  "model": "llama-3.1-8b-instant",
+  "contents": [{"role": "user", "parts": [{"text": "How do I write a Python function?"}]}],
   "temperature": 0.7,
   "max_tokens": 2048
 }
 ```
+Response: Server-Sent Events stream with token chunks, final `meta` (tokens/time/provider/model), then `[DONE]`.
 
-Response: Server-Sent Events stream with token chunks
-
-#### 2. Chat Endpoint (Non-Streaming)
+#### 3. Chat Endpoint (Non-Streaming)
 **POST** `/api/chat`
-
-Request:
 ```json
 {
   "provider": "gemini",
-  "contents": [
-    {
-      "role": "user",
-      "parts": [{"text": "Explain async/await in JavaScript"}]
-    }
-  ],
+  "model": "gemini-2.0-flash",
+  "contents": [{"role": "user", "parts": [{"text": "Explain async/await in JavaScript"}]}],
   "temperature": 0.7,
   "max_tokens": 2048
 }
 ```
-
 Response:
 ```json
 {
   "text": "...",
-  "meta": {
-    "tokens": 150,
-    "time": 2.45,
-    "provider": "Google Gemini (FREE)"
-  }
+  "meta": {"tokens": 150, "time": 2.45, "provider": "gemini", "model": "gemini-2.0-flash"}
 }
 ```
 
-#### 3. Title Generation
+#### 4. Title Generation
 **POST** `/api/title`
-
-Request:
 ```json
-{
-  "provider": "groq",
-  "message": "How do I optimize my React components?"
-}
+{"provider": "groq", "message": "How do I optimize my React components?"}
+```
+Response: `{"title": "React Performance Optimization"}`
+
+## Client
+
+`client.py` is a ready-to-use API client:
+```bash
+python client.py basic        # Test Groq + Gemini
+python client.py stream       # Streaming demo
+python client.py title        # Title generation demo
+python client.py temp         # Temperature comparison
+python client.py interactive  # Interactive chat (/provider, /model, /stream, /quit)
 ```
 
-Response:
-```json
-{
-  "title": "React Performance Optimization"
-}
+```python
+from client import VoxBoxClient
+
+client = VoxBoxClient(token="your-token-if-set")
+result = client.chat("Write a factorial function", provider="groq")
+print(result["text"])
 ```
-
-## Free Provider Parameters
-
-Supported provider values: `groq`, `gemini`
-
-**Default provider**: `groq` (if not specified)
-
-## Coding Capabilities
-
-VoxBox supports coding assistance across 40+ languages including:
-- Python, JavaScript, TypeScript, Java, C, C++, C#, Go, Rust
-- PHP, Ruby, Swift, Kotlin, Dart, SQL, HTML, CSS
-- Bash, YAML, JSON, R, Scala, Perl, Lua, MATLAB
-- Haskell, Elixir, Clojure, Assembly, and more
-
-### Tasks Supported
-- Write functions/classes
-- Debug errors
-- Explain code
-- Language conversion
-- Performance optimization
-- Unit test generation
-- Algorithm assistance
-- API integrations
-- Regex patterns
-- SQL queries
-- Git workflows
-- DevOps scripts
-- Architecture design
 
 ## Configuration
 
-### Temperature
-Controls randomness (0.0-2.0):
-- 0.0 = deterministic (best for code)
-- 0.7 = balanced
-- 1.5+ = creative
+### `.env` variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `GROQ_API_KEY` | — | Enables the Groq provider |
+| `GOOGLE_API_KEY` | — | Enables the Gemini provider |
+| `GROQ_MODEL` | `llama-3.1-8b-instant` | Default Groq model |
+| `GEMINI_MODEL` | `gemini-2.0-flash` | Default Gemini model |
+| `VOXBOX_API_TOKEN` | — | If set, requires `X-VoxBox-Token` on all API calls |
+| `PORT` | `5000` | Flask port |
+
+### Temperature (0.0–2.0)
+- **0.0** deterministic (best for code) · **0.7** balanced (default) · **1.5+** creative
 
 ### Max Tokens
-Maximum response length (default: 2048)
-
-## Provider Comparison
-
-| Feature | Groq | Gemini |
-|---------|------|--------|
-| **Cost** | ✅ FREE | ✅ FREE |
-| **Credit Card** | ❌ Not required | ❌ Not required |
-| **Speed** | ⚡⚡⚡ Fastest | ⚡⚡ Fast |
-| **Quality** | ⭐⭐⭐ Good | ⭐⭐⭐⭐ Excellent |
-| **Free Tier** | Unlimited | Unlimited |
-| **Rate Limits** | Fair use | Fair use |
+Default: 2048. Adjustable in Settings or per request.
 
 ## Troubleshooting
 
-### Provider not available
-- Ensure API key is set in `.env`
-- Check API key is valid on provider's website
-- Restart Flask server
+### "No provider available"
+- Ensure at least one API key is set in `.env`
+- Restart the server after editing `.env`
 
-### Import Error
+### 401 Unauthorized
+- The server has `VOXBOX_API_TOKEN` set — add the token in Settings, or send the `X-VoxBox-Token` header.
+
+### Import errors
 ```bash
 pip install -r requirements.txt --upgrade
 ```
 
 ### No response
-- Try the other free provider
-- Check internet connection
-- Check server logs
+- Try the other provider from the model dropdown
+- Check the server console for the real error message
 
 ## Requirements
 
-See `requirements.txt` for all dependencies:
-- Flask 2.3.0
-- python-dotenv 1.0.0
-- groq 0.4.2
-- google-generativeai 0.3.0
+See `requirements.txt`: Flask, Flask-Cors, python-dotenv, groq, google-genai.
 
 ## License
 
-MIT License - feel free to use and modify
-
-## Support
-
-For issues or questions, please open an issue in the repository.
-
----
-
-**✨ 100% Free | No Credit Card | No Hidden Costs ✨**
+MIT License — feel free to use and modify.

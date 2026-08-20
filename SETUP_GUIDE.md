@@ -1,14 +1,20 @@
 # VoxBox AI — Setup Guide
 
-VoxBox is a free voice coding assistant with two free AI providers: **Groq** and **Google Gemini**. One key is enough; providers without a key are simply hidden.
+VoxBox is a production-grade free AI coding assistant with **automatic provider
+fallback** across Gemini, Groq, OpenRouter and local Ollama. One key is enough;
+providers without a key are simply hidden.
 
 ## What's Included
 
-- Groq + Gemini providers with in-UI model switching
-- Streaming (SSE) and non-streaming chat, title generation, model listing
-- Browser code execution (JavaScript / Python / HTML)
-- Voice input/output, conversation history, import/export, token usage per chat
-- Optional API token auth and CORS support
+- Multi-provider routing (Gemini → Groq → OpenRouter → Ollama) with health tracking + backoff
+- Dynamic model discovery (retired models are auto-disabled)
+- Streaming (SSE) + non-streaming chat, title generation, model listing, health endpoint
+- Current-information retrieval with source citations (DuckDuckGo, no key required)
+- Durable conversation memory (`data/memory.json`), long-conversation summarization
+- Browser code execution (JavaScript / Python via Pyodide / HTML in sandboxed iframes)
+- Voice input/output, conversation history, search, import/export, token tracking
+- Professional responsive UI (light/dark, command palette, settings, mobile)
+- Request validation, rate limiting, prompt-injection isolation, optional token auth, restricted CORS
 
 ## Quick Start
 
@@ -23,19 +29,17 @@ copy .env.example .env   # Windows (cmd)
 # Copy-Item .env.example .env   # PowerShell
 ```
 ```env
+GEMINI_API_KEY="your_free_google_key"   # or GOOGLE_API_KEY (alias)
 GROQ_API_KEY="your_free_groq_key"
-GOOGLE_API_KEY="your_free_google_key"
 ```
-
-Optional:
+Optional (OpenRouter / local):
 ```env
-GROQ_MODEL="llama-3.1-8b-instant"      # default Groq model
-GEMINI_MODEL="gemini-2.0-flash"        # default Gemini model
-VOXBOX_API_TOKEN="secret"              # protect the API
-PORT=5000
+OPENROUTER_API_KEY="your_key"
+OLLAMA_HOST="http://localhost:11434"
+OLLAMA_MODEL="llama3.2"
 ```
 
-Get free keys (no credit card): https://console.groq.com/ and https://aistudio.google.com/app/apikey
+Get free keys (no credit card): https://aistudio.google.com/app/apikey and https://console.groq.com
 
 ### 3. Run
 ```bash
@@ -45,18 +49,20 @@ Open `http://localhost:5000`.
 
 ## Example Requests
 
-### Groq (streaming)
+### Chat (auto provider, streaming)
 ```bash
-curl -X POST http://localhost:5000/api/chat/stream \
+curl -N -X POST http://localhost:5000/api/chat/stream \
   -H "Content-Type: application/json" \
-  -d '{"provider":"groq","model":"llama-3.1-8b-instant","contents":[{"role":"user","parts":[{"text":"Hi!"}]}]}'
+  -d '{"contents":[{"role":"user","parts":[{"text":"Explain recursion"}]}]}'
 ```
+Frames: `{"token":"…"}` … `{"meta":{…}}` … `[DONE]`. On provider failure you may
+see `{"status":"VoxBox is switching to another AI provider..."}` before tokens resume.
 
-### Gemini (non-streaming)
+### Non-streaming
 ```bash
 curl -X POST http://localhost:5000/api/chat \
   -H "Content-Type: application/json" \
-  -d '{"provider":"gemini","model":"gemini-2.0-flash","contents":[{"role":"user","parts":[{"text":"Hi!"}]}]}'
+  -d '{"contents":[{"role":"user","parts":[{"text":"Hi!"}]}]}'
 ```
 
 ### With auth token
@@ -64,52 +70,68 @@ curl -X POST http://localhost:5000/api/chat \
 curl -X POST http://localhost:5000/api/chat \
   -H "Content-Type: application/json" \
   -H "X-VoxBox-Token: your_secret" \
-  -d '{"provider":"groq","contents":[{"role":"user","parts":[{"text":"Hi!"}]}]}'
+  -d '{"contents":[{"role":"user","parts":[{"text":"Hi!"}]}]}'
 ```
 
-### List available providers/models
+### Health / models
 ```bash
+curl http://localhost:5000/api/health
 curl http://localhost:5000/api/models
 ```
 
 ## Model Customization
 
-Available models are defined in `PROVIDERS` inside `app_groq.py`. To add a model,
-append `{"id": "model-id", "label": "Display Label"}` to the provider's `models`
-list. To change the default, set `GROQ_MODEL` / `GEMINI_MODEL` in `.env`.
+Default models come from `.env` (`GEMINI_MODEL`, `GROQ_MODEL`, `OPENROUTER_MODEL`,
+`OLLAMA_MODEL`). At startup each provider discovers its available models; the configured
+default is used if present, otherwise the first available model wins. Disabled/404 models
+are skipped automatically — never edit code to retire a model.
 
 ## API Summary
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/api/models` | GET | List enabled providers + models |
+| `/` | GET | Web UI |
+| `/api/models` | GET | List enabled providers, models, defaults |
+| `/api/health` | GET | Server + provider health |
 | `/api/chat` | POST | Non-streaming chat |
 | `/api/chat/stream` | POST | SSE streaming chat |
 | `/api/title` | POST | Conversation title |
-| `/` | GET | Web UI |
+| `/api/memory` | GET | List memories |
+| `/api/memory/<id>` | DELETE | Delete one memory |
+| `/api/memory/clear` | POST | Clear all memories |
 
-Request body: `{provider, model, contents: [{role, parts: [{text}]}], temperature, max_tokens}`.
+Request body: `{provider: "auto"|"gemini"|"groq"|"openrouter"|"ollama", model, contents: [{role, parts: [{text}]}], temperature, max_tokens}`.
 
 If `VOXBOX_API_TOKEN` is set, every request needs `X-VoxBox-Token: <token>`.
 
 ## Architecture
 
 ```
-Browser (app_groq.py embedded UI)
-  └─ /api/chat(stream) ─ Groq SDK ──► Groq API (llama-3.1-8b-instant, ...)
-                       └ google-genai SDK ─► Google Gemini API (gemini-2.0-flash, ...)
+Browser (frontend.html)
+  └─ /api/chat(stream) ─┐
+                        ▼
+              AIRouter (voxbox/providers)
+              Gemini → Groq → OpenRouter → Ollama
+                        │
+                        ├─ classifier  (CURRENT_INFORMATION? → web search)
+                        ├─ context     (summarize long chats, memory)
+                        └─ security    (validate, rate limit, sanitize)
 ```
-- Streaming uses Server-Sent Events; each `data:` frame carries a token chunk.
-- The final frame carries `meta` with token count, elapsed time, provider, and model.
-- Token counts come from provider usage metadata when available, otherwise estimated.
-- The UI stores conversations in `localStorage` (title, history, tokens).
+
+- Provider state is tracked (available / rate_limited / temporarily_unavailable / invalid)
+  with exponential backoff; retries stop after the configured fallback budget.
+- Search results are injected as `<external_data>` (untrusted) so instructions in web
+  content cannot override the system prompt.
+- The UI stores conversations in `localStorage`; durable memory is server-side in
+  `data/memory.json` (gitignored).
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| "No provider available" | Add a key to `.env`, restart server |
+| "No AI provider is available" | Add at least one key to `.env`, restart server |
 | 401 Unauthorized | Provide `X-VoxBox-Token` or set it in Settings |
 | Import errors | `pip install -r requirements.txt --upgrade` |
 | Slow Python run in UI | First run downloads Pyodide (~10 MB), then it's cached |
-| Gemini model not listed | Check `GOOGLE_API_KEY`, restart server |
+| Gemini unavailable in health | Free-tier quota may be exhausted; the router auto-falls back to Groq |
+| Local Ollama missing | Install Ollama or set `ENABLE_LOCAL_FALLBACK=false` |

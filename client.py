@@ -8,7 +8,14 @@ Groq and Google Gemini providers.
 import requests
 import json
 import time
+import sys
 from typing import Optional
+
+# Make console output encoding-safe (Windows cp1252 cannot print some unicode)
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 class VoxBoxClient:
     def __init__(self, base_url: str = "http://localhost:5000", token: str = ""):
